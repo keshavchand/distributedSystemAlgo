@@ -23,18 +23,12 @@ func initNodes(c int) ([]Node, map[int64]struct{}) {
 	mapping := make(map[int64]struct{})
 
 	nodes := make([]Node, c)
-	// uids := []int64{5, 8, 6, 4} // @NoCommit
 	for i, _ := range nodes {
 		next := (i + 1) % len(nodes)
 		c1 := make(chan Message, 1)
 		c2 := make(chan Message, 1)
+		nodes[i].uid = createUid(mapping)
 
-		// uid := createUid(mapping)
-		// nodes[i].uid = uid[i]
-
-		nodes[i].uid = int64(i)
-
-		// nodes[i].uid = uids[i] // @NoCommit
 
 		nodes[i].outBoxRight = c1
 		nodes[next].inBoxLeft = c1
@@ -47,7 +41,6 @@ func initNodes(c int) ([]Node, map[int64]struct{}) {
 }
 
 func reinitNode(n *Node, mapping map[int64]struct{}) {
-	return // @NoCommit
 	delete(mapping, n.uid)
 	n.uid = createUid(mapping)
 }

@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"log"
+	"sync"
+	"sync/atomic"
 )
 
 type Direction int
@@ -30,7 +32,8 @@ type Node struct {
 	isLeader bool
 	uid      int64
 
-	ctx        context.Context
+	ctx context.Context
+
 	outBoxLeft chan<- Message
 	inBoxLeft  <-chan Message
 
@@ -104,11 +107,15 @@ func (n *Node) BroadcastWinning() context.CancelFunc {
 func (n *Node) runElection() context.CancelFunc {
 	hops := 1
 
+	iter := Iter
 	cancel := func() {}
-
 	n.isLeader = false
+
+	seenOneWinnerMessageBefore := false
+
+	var wg sync.WaitGroup
+	defer wg.Wait()
 	for !n.isLeader {
-		// log.Println("Running For Hops", hops)
 		n.broadcast(int64(hops))
 
 		isLargestInLeft := false
@@ -117,7 +124,7 @@ func (n *Node) runElection() context.CancelFunc {
 		for !isLargestInLeft || !isLargestInRight {
 			select {
 			case m := <-n.inBoxLeft:
-				if m.Iter < Iter {
+				if m.Iter < iter {
 					continue
 				}
 
@@ -130,37 +137,55 @@ func (n *Node) runElection() context.CancelFunc {
 					return cancel
 				}
 
-
 				// Accoring to hs if the message came from other side
 				// we won the algorithm
 				if n.isWinner(m, LEFT) {
+					if !seenOneWinnerMessageBefore {
+						seenOneWinnerMessageBefore = true
+						continue
+					}
+
 					isLargestInRight = true
 					if !n.isLeader {
 						n.isLeader = true
-						log.Println("Brodcasting", n.uid)
 						cancel = n.BroadcastWinning()
 					}
 				} else if n.isMaxima(m) {
 					isLargestInLeft = true
 				} else {
-					n.forward(m, LEFT)
+					wg.Add(1)
+					// XXX: Sometime writing to channel of opposite
+					// goroutine makes both of them deadlock
+					go func(m Message) {
+						n.forward(m, LEFT)
+						wg.Done()
+					}(m)
 				}
 
 			case m := <-n.inBoxRight:
-				if m.Iter < Iter {
+				if m.Iter < iter {
 					continue
 				}
+
 				if n.isWinner(m, RIGHT) {
+					if !seenOneWinnerMessageBefore {
+						seenOneWinnerMessageBefore = true
+						continue
+					}
+
 					isLargestInLeft = true
 					if !n.isLeader {
 						n.isLeader = true
-						log.Println("Brodcasting", n.uid)
 						cancel = n.BroadcastWinning()
 					}
 				} else if n.isMaxima(m) {
 					isLargestInRight = true
 				} else {
-					n.forward(m, RIGHT)
+					wg.Add(1)
+					go func(m Message) {
+						n.forward(m, RIGHT)
+						wg.Done()
+					}(m)
 				}
 			}
 		}
@@ -175,31 +200,16 @@ var sg2 SyncBarrier = newSyncBarrier(count)
 
 func (n *Node) start() {
 	for {
-		//XXX: This is a hack to prevent goroutines from deadlocking
-		// Apparently there is some zombie messages in the queue 
-		// that causes the program to deadlock
-		drainChannel:
-		for {
-			select {
-			case m := <-n.inBoxLeft:
-				log.Println("LEFT", m)
-			case m := <-n.inBoxRight:
-				log.Println("RIGHT", m)
-			default:
-				break drainChannel
-			}
-		}
-
 		sg1.Wait()
 		cancel := n.runElection()
 
 		if n.isLeader {
-			log.Println("------------------Leader Selected: ", n.uid)
+			log.Println("Leader Selected: ", n.uid)
+			log.Println("ITER: -----------------------------------", Iter)
 
 			sg2.Wait()
+			atomic.AddInt64(&Iter, 1)
 			cancel()
-			Iter++
-			log.Println("Leader Died: ", n.uid)
 			return
 		}
 
