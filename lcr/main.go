@@ -78,8 +78,6 @@ func (n *Node) runElection() context.CancelFunc {
 		// Someone worse than us appeared
 		// ignored
 	}
-
-	// Why would we close the inBox ???
 	return cancel
 }
 
@@ -135,19 +133,31 @@ func reinitNode(n *Node, mapping map[int64]struct{}) {
 }
 
 func main() {
-	nodes, mapping := initNodes(2000)
+	nodes, mapping := initNodes(10)
 
 	var m sync.Mutex
-	for _, n := range nodes {
-		go func(n Node) {
+	for i := 0; i < len(nodes); i++ {
+		go func(n *Node) {
 			for {
 				n.start()
 
 				m.Lock()
-				reinitNode(&n, mapping)
+
+				// Begin Sanity Check
+				var max int64 = 0
+				for _, node := range nodes {
+					if node.uid > max {
+						max = node.uid
+					}
+				}
+
+				log.Println("MAX UID", max)
+				// End Sanity Check
+
+				reinitNode(n, mapping)
 				m.Unlock()
 			}
-		}(n)
+		}(&nodes[i])
 	}
 
 	select {}
