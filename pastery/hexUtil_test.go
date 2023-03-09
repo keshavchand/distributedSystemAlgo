@@ -1,5 +1,4 @@
 package main
-
 import "testing"
 
 func TestHexIdx(t *testing.T) {
@@ -12,37 +11,33 @@ func TestHexIdx(t *testing.T) {
 }
 
 func TestComparitive(t *testing.T) {
+	parse := func (s string) *Hash {
+		r, e := parseHash(s)
+		if e != nil{
+			panic(e)
+		}
+		return r
+	}
+
 	cases := []struct{
-		hash string
-		to string
-		from string
+		hash *Hash
+		to *Hash
+		from *Hash
 		res bool
 	} {
-		{"abcd", "abce", "dddd", true},
-		{"abcd", "dddd", "abce", false},
+		{parse("abcd"), parse("abce"), parse("dddd"), true},
+		{parse("abcd"), parse("dddd"), parse("abce"), false},
+		{parse("c8"), parse("d1"), parse("c7"), false},
 	}
-	for _, c := range cases{
-		r, _ := isComparativelyCloserTo(c.hash, c.to, c.from, -1)
+	for i, c := range cases{
+		r := isComparativelyCloserTo(c.hash, c.to, c.from)
 		if r != c.res {
-			t.Errorf("Comparitive Close Function Failed %v", c)
-		}
-	}
-
-	cases2 := []struct {
-		hash string
-		to string
-		from string
-		at int
-		res bool 
-	} {
-		{"abcd", "abce", "abcf", 3, true},
-		{"abcd", "abcf", "abce", 3, false},
-	}
-
-	for _, c := range cases2{
-		r, _ := isComparativelyCloserTo(c.hash, c.to, c.from, c.at)
-		if r != c.res {
-			t.Errorf("Comparitive Close Function Failed %v", c)
+			t.Errorf("%d: Comparitive Close Function Failed %s %s %s",
+				i,
+				c.hash.val.String(),
+				c.to.val.String(),
+				c.from.val.String(),
+			)
 		}
 	}
 }

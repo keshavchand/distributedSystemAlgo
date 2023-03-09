@@ -3,11 +3,10 @@ package main
 import (
 	"bufio"
 	"crypto/sha256"
+	"flag"
 	"fmt"
 	"log"
 	"net"
-	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 )
@@ -15,7 +14,7 @@ import (
 type ConnectedNodeInfo struct {
 	net.Conn
 	Addr   string
-	NodeId string
+	NodeId *Hash
 }
 
 var rwLock sync.RWMutex
@@ -24,10 +23,24 @@ var leafNodesLeft [16]ConnectedNodeInfo
 var leafNodesRight [16]ConnectedNodeInfo
 
 // 32 hex digits
-var selfAddr = "localhost:8080" // Debug
-var selfNodeId string
+var selfAddr string
+var selfNodeId *Hash
+
+var GlobalWaitGroup sync.WaitGroup
 
 func main() {
+	log.SetFlags(log.Lshortfile | log.LstdFlags)
+
+	defer GlobalWaitGroup.Wait()
+	var addrToConnect string
+
+	// Flag Start
+	flag.StringVar(&selfAddr, "addr", "localhost:8081", "Address of this node")
+	flag.StringVar(&addrToConnect, "atc", "", "Address to use to join the node")
+	flag.Parse()
+
+	// Flag Stop
+
 	leafNodesLeft = [16]ConnectedNodeInfo{}
 	leafNodesRight = [16]ConnectedNodeInfo{}
 	routingTable = [32][16]ConnectedNodeInfo{}
@@ -35,9 +48,99 @@ func main() {
 	h := sha256.New()
 	h.Write([]byte(selfAddr))
 	hash := h.Sum(nil)[:16]
-	selfNodeId = fmt.Sprintf("%x", hash)
+	var err error
+	selfNodeId, err = parseHash(fmt.Sprintf("%x", hash))
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	log.Println("Self Node Id:", selfNodeId)
+
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	if addrToConnect != "" {
+		wg.Add(1)
+		GlobalWaitGroup.Add(1)
+		go func() {
+			defer wg.Done()
+			defer GlobalWaitGroup.Done()
+
+			rts := make(map[string]struct{})
+			leaf := make(map[string]struct{})
+			joinNetwork(addrToConnect, rts, leaf)
+
+			delete(rts, addrToConnect)
+			delete(leaf, addrToConnect)
+
+			for k, _ := range rts {
+				conn, err := net.Dial("tcp", k)
+				if err != nil {
+					log.Println(err)
+					continue
+				}
+
+				fmt.Fprintf(conn, "notify\n")
+				fmt.Fprintf(conn, "%s %s\n", selfAddr, selfNodeId.hash)
+
+				scanner := bufio.NewScanner(conn)
+				if !scanner.Scan() { continue /* TODO: Error Checking */ }
+				data := strings.Split(scanner.Text(), " ")
+
+				hash, _ := parseHash(data[1])
+
+				t := ConnectedNodeInfo {
+					Conn: conn,
+					Addr: data[0],
+					NodeId: hash,
+				}
+
+				p := idPrefixCount(hash)
+				d, _ := hexIdx(hash.hash[p])
+
+				insertInRoutingTable(p, d, t)
+				insertInLeafNode(t)
+
+				GlobalWaitGroup.Add(1)
+				go func() {
+					defer GlobalWaitGroup.Done()
+					handleConnection(conn)
+				} ()
+			}
+
+			for k, _ := range leaf {
+				if _, ok := rts[k]; ok {
+					continue
+				}
+				conn, err := net.Dial("tcp", k)
+				if err != nil {
+					log.Println(err)
+					continue
+				}
+
+				fmt.Fprintf(conn, "notify\n")
+				fmt.Fprintf(conn, "%s %s\n", selfAddr, selfNodeId.hash)
+
+				scanner := bufio.NewScanner(conn)
+				if !scanner.Scan() { continue /* TODO: Error Checking */ }
+				data := strings.Split(scanner.Text(), " ")
+				hash, _ := parseHash(data[1])
+
+				t := ConnectedNodeInfo {
+					Conn: conn,
+					Addr: data[0],
+					NodeId: hash,
+				}
+
+				insertInLeafNode(t)
+
+				GlobalWaitGroup.Add(1)
+				go func() {
+					defer GlobalWaitGroup.Done()
+					handleConnection(conn)
+				} ()
+			}
+		}()
+	}
 
 	n, err := net.Listen("tcp", selfAddr)
 	if err != nil {
@@ -46,8 +149,6 @@ func main() {
 
 	log.Println("Server Listening At", selfAddr)
 
-	var wg sync.WaitGroup
-	defer wg.Wait()
 	for {
 		conn, err := n.Accept()
 		if err != nil {
@@ -57,177 +158,252 @@ func main() {
 
 		wg.Add(1)
 		go func(conn net.Conn) {
-			helpNodeToJoin(conn)
-			// TODO: Handle get/set requests
-			wg.Done()
+			defer wg.Done()
+			defer func() {
+				log.Println("Closing Connection")
+				err := conn.Close()
+				if err != nil {
+					log.Println("Closing Connection", err)
+				}
+			}()
+			handleConnection(conn)
 		}(conn)
 	}
 }
 
-func helpNodeToJoin(conn net.Conn) {
+func handleConnection(conn net.Conn) {
+	defer cleanup(conn)
+	var nodeInfo *ConnectedNodeInfo
+	// cleanup routing table and leaf node
+	// after removal
 	scanner := bufio.NewScanner(conn)
-	if !scanner.Scan() {
-		log.Println(conn.LocalAddr(), "Join Err")
-		return
+	for scanner.Scan() {
+		command := strings.ToLower(scanner.Text())
+		switch command {
+		case "join":
+			if nodeInfo != nil {
+				fmt.Fprintf(conn, "Already Joined\n")
+				continue
+			}
+
+			info, resp, err := helpNodeToJoin(scanner)
+			if err != nil {
+				fmt.Fprintf(conn, "Parsing Error %v", err)
+				continue
+			}
+			info.Conn = conn
+
+			nodeInfo = info
+			manageInternalJoin(info)
+			fmt.Fprintf(conn, resp)
+		case "notify":
+			err := handleNotify(conn, scanner)
+			if err != nil {
+				fmt.Fprintf(conn, "Parsing Error %v", err)
+				log.Printf("Parsing Error %v", err)
+				continue
+			}
+		case "exit":
+			break
+		default:
+			fmt.Fprintf(conn, "Unimplemented : %s", command)
+		}
 	}
+}
+
+func cleanup(conn net.Conn) {}
+
+func handleNotify(conn net.Conn, scanner *bufio.Scanner) error {
 	/*
-	* JOIN struture
-	* JOIN addr HashAddr from
-	 */
-	join := scanner.Text()
-	if !strings.HasPrefix(join, "JOIN") {
-		log.Println(conn.LocalAddr(), "Expected Join")
-		return
+	* Notify Structure
+	* <Addr> <Info>
+	*
+	* reply:
+	* <Self Addr> <Info>
+	*/
+	if !scanner.Scan() {
+		log.Println("Can't read from scanner")
+		return fmt.Errorf("Can't read from scanner")
 	}
 
-	rem := strings.TrimLeft(join, "JOIN")
-	// Empty string because of space after join
-	addr := strings.Split(rem, " ")[1:]
+	joinAddr := scanner.Text()
+	addr := strings.Split(joinAddr, " ")
 
-	if len(addr) != 3 {
-		log.Println(conn.LocalAddr(), "Join Structure Error: Not Enough args")
-		return
+	if len(addr) < 2 {
+		return fmt.Errorf("Wrong Structure")
 	}
 
 	log.Println("Addr: ", addr[0], "Hash: ", addr[1])
-
-	hash := addr[1]
+	hash, err := parseHash(addr[1])
+	if err != nil {
+		return err
+	}
 	prefixCount := idPrefixCount(hash)
 	if prefixCount == 32 {
-		log.Println(addr[0], "XXX: Hash Collision")
-		fmt.Fprintf(conn, "XXX: Hash Collision")
-		conn.Close()
-		return
+		return fmt.Errorf("Hash Collision")
 	}
 
-	from, err := strconv.Atoi(addr[2])
+	d, err := hexIdx(hash.hash[prefixCount])
 	if err != nil {
-		log.Println(conn.LocalAddr(), "XXX: From Field Err %v", err)
-		fmt.Fprintf(conn, "XXX: From Field Err %v", err)
-		conn.Close()
-		return
+		return err
 	}
 
-	/*
-	* RESPONSE:
-	* selfAddr, selfNodeId
-	* <routing table till matched prefix> ....
-	* <Next Closest>
-	* if nextClosest == self { <Leaf Noded> }
-	 */
-
-	rwLock.Lock()
-	defer rwLock.Unlock()
-
-	resp := &strings.Builder{}
-	fmt.Fprintf(resp, "%s %s\n", selfAddr, selfNodeId)
-	{ // Writing Routing Table Info
-		written := 0
-		for i := from; i <= prefixCount; i++ {
-			for j := 0; j < 16; j++ {
-				rtInfo := routingTable[i][j]
-				if rtInfo.Conn != nil {
-					if written != 0 {
-						fmt.Fprintf(resp, ";")
-					}
-					fmt.Fprintf(resp, "%s %s", rtInfo.Addr, rtInfo.NodeId)
-					written += 1
-				}
-			}
-		}
-		fmt.Fprintf(resp, "\n")
-	}
-
-	// Find the next closest
-	bestConn, err := getClosestNode(hash, routingTable[prefixCount], leafNodesLeft, leafNodesRight)
-	if err != nil {
-		log.Println(addr[0], err)
-		fmt.Fprintf(conn, "Internal Server Error: %v", err)
-		conn.Close()
-		return
-	}
-	fmt.Fprintf(resp, "%s %s\n", bestConn.Addr, bestConn.NodeId)
-
-	// TODO:
-	// Send Leaf Nodes
-	strResp := resp.String()
-
-	written := 0
-	for written < len(strResp) {
-		w, err := conn.Write([]byte(strResp[written:]))
-		if err != nil {
-			log.Println("Error Writing To Socket", err)
-			conn.Close()
-			return
-		}
-		written += w
-	}
-
-	d, err := hexIdx(hash[prefixCount])
-	if err != nil {
-		log.Println(err)
-		conn.Close()
-		return
-	}
-	if routingTable[prefixCount][d].Conn == nil {
-		routingTable[prefixCount][d] = ConnectedNodeInfo{
-			Conn:   conn,
-			Addr:   addr[0],
-			NodeId: hash,
-		}
-	} else {
-		// TODO:
-		// What to do when there already exists a connection in its place??
-	}
-
-	r := Compare(hash, selfNodeId)
-	if r == 0 {
-		log.Println(conn.LocalAddr(), "XXX: Hash Collision")
-		fmt.Fprintf(conn, "XXX: Hash Collision")
-		conn.Close()
-		return
-	}
-
-	leafNodes := &leafNodesLeft
-	if r > 0 {
-		leafNodes = &leafNodesRight
-	}
-
-	t := ConnectedNodeInfo{
+	info := ConnectedNodeInfo{
 		Conn:   conn,
 		Addr:   addr[0],
 		NodeId: hash,
 	}
 
-	// It is Lesser than the node
-	shiftAtIdx := len(leafNodes)
-	for i, n := range leafNodes {
-		if n.Conn == nil {
-			leafNodes[i] = t
-			return
-		}
-		if t, _ := isComparativelyCloserTo(selfNodeId, hash, n.NodeId, -1); t {
-			shiftAtIdx = i
-			break
-		}
+	rwLock.Lock()
+	defer rwLock.Unlock()
+	if !insertInRoutingTable(prefixCount, d, info) {
+		log.Println("Can't Insert Collision with ", info.NodeId.hash,
+			routingTable[prefixCount][d].NodeId.hash)
 	}
+	insertInLeafNode(info)
 
-	for i := shiftAtIdx; i < len(leafNodes) && t.Conn != nil; i++ {
-		_t := leafNodes[i]
-		leafNodes[i] = t
-		t = _t
-	}
+	fmt.Fprintf(conn, "%s %s\n", selfAddr, selfNodeId.hash)
+	log.Println("Connected ", addr, hash)
+	return nil
 }
 
-func getClosestNode(hash string, tables ...[16]ConnectedNodeInfo) (ConnectedNodeInfo, error) {
+func joinNetwork(addr string, rts, leaf map[string]struct{}) {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	h := sha256.New()
+	h.Write([]byte(selfAddr))
+	hash := h.Sum(nil)[:16]
+	selfNodeId, err = parseHash(fmt.Sprintf("%x", hash))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Fprintf(conn, "join\n")
+	fmt.Fprintf(conn, "%s %x\n", selfAddr, hash[:16])
+
+	/*
+	* Response
+	* <SERVER URL> <SERVER ID>
+	* <ROUTING TABLE> .....
+	* <Best SERVER URL known> <SERVER ID>
+	* if (best ServerUrl == SERVER URL)
+	 */
+
+	// TODO: scanner.Text() may return error
+	// check for that
+	scanner := bufio.NewScanner(conn)
+	if !scanner.Scan() {
+		log.Fatal("Unexprected Response from server when joining")
+	}
+	serverInfo := scanner.Text()
+	url, id, found := strings.Cut(serverInfo, " ")
+	if !found {
+		log.Fatalf("Unexprected Response from server when joining : Server address %s", serverInfo)
+	}
+	log.Println("Server Info", url, id)
+
+	func () {
+		rwLock.Lock()
+		defer rwLock.Unlock()
+		id, err := parseHash(id)
+		if err != nil {
+			log.Println(err)
+			return
+		}
+		t := ConnectedNodeInfo{
+			Conn:   conn,
+			Addr:   url,
+			NodeId: id,
+		}
+
+		prefixCount := idPrefixCount(id)
+		if prefixCount == 32 {
+			log.Fatal("XXX: Hash Collision") // EH???
+		}
+
+		d, err := hexIdx(id.hash[prefixCount])
+		if err != nil {
+			log.Println(err)
+			return
+		}
+		insertInRoutingTable(prefixCount, d, t)
+		insertInLeafNode(t)
+	} ()
+
+	if !scanner.Scan() {
+		log.Fatal("Expected from server: Routing Table : Scanner Failed")
+	}
+
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	serverInfo = scanner.Text()
+	routingTableInfo := strings.Split(serverInfo, ";")
+	for _, rtInfo := range routingTableInfo {
+		addr, _, found := strings.Cut(rtInfo, " ")
+		if !found {
+			log.Println(rtInfo)
+			return
+		}
+
+		if addr == selfAddr {
+			continue
+		}
+		log.Println("Got: ", addr, id)
+		rts[addr] = struct{} {}
+	}
+
+	if !scanner.Scan() {
+		log.Fatal("Unexprected Response from server when joining")
+	}
+	serverInfo = scanner.Text()
+	closestUrl, closestId, found := strings.Cut(serverInfo, " ")
+	if !found {
+		log.Fatalf("Unexprected Response from server when joining : Server address %s", serverInfo)
+	}
+	log.Println("Server Info", closestUrl, closestId)
+
+	if closestId == id {
+		// Accept leaf nodes
+		if !scanner.Scan() {
+			log.Fatal("Expected from server: Routing Table : Scanner Failed")
+		}
+
+		serverInfo = scanner.Text()
+		routingTableInfo := strings.Split(serverInfo, ";")
+		for _, rtInfo := range routingTableInfo {
+			addr, _, found := strings.Cut(rtInfo, " ")
+			if !found {
+				log.Println(rtInfo)
+				break
+			}
+			if addr == selfAddr {
+				continue
+			}
+			leaf[addr] = struct{} {}
+		}
+	} else {
+		joinNetwork(closestUrl, rts, leaf)
+		delete(rts, closestUrl)
+		delete(leaf, closestUrl)
+	}
+
+	GlobalWaitGroup.Add(1)
+	go func() {
+		defer GlobalWaitGroup.Done()
+		handleConnection(conn)
+	}()
+}
+
+func getClosestNode(hash *Hash, tables ...[16]ConnectedNodeInfo) (ConnectedNodeInfo, error) {
 	bestConn := ConnectedNodeInfo{
 		Conn:   nil,
 		Addr:   selfAddr,
 		NodeId: selfNodeId,
 	}
-
-	prefixCount := idPrefixCount(hash)
-	closest := prefixCount
 
 	// Check Leaf Nodes
 	for _, table := range tables {
@@ -236,24 +412,10 @@ func getClosestNode(hash string, tables ...[16]ConnectedNodeInfo) (ConnectedNode
 			if t.Conn == nil {
 				continue
 			}
-			if len(t.NodeId) != 32 {
-				runtime.Breakpoint()
-			}
 
-			count := idPrefixCountWith(hash, t.NodeId)
-			if count == 32 {
-				runtime.Breakpoint()
-				return ConnectedNodeInfo{}, fmt.Errorf("XXX: Hash Collision")
-			}
-
-			if count < closest {
-				continue
-			}
-
-			isCloser, _ := isComparativelyCloserTo(hash, t.NodeId, bestConn.NodeId, count)
+			isCloser := isComparativelyCloserTo(hash, t.NodeId, bestConn.NodeId)
 			if isCloser {
 				bestConn = t
-				closest = count
 			}
 
 		}
