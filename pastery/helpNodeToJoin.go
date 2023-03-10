@@ -12,32 +12,15 @@ func helpNodeToJoin(scanner *bufio.Scanner) (*ConnectedNodeInfo, string, error) 
 	* JOIN struture
 	* JOIN addr HashAddr
 	 */
-	if !scanner.Scan() {
-		log.Println("Can't read from scanner")
-		return nil, "", fmt.Errorf("Can't read from scanner")
-	}
 
-	joinAddr := scanner.Text()
-	// Empty string because of space after join
-	addr := strings.Split(joinAddr, " ")
-
-	if len(addr) < 2 {
-		return nil, "", fmt.Errorf("Wrong Structure")
-	}
-
-	log.Println("Addr: ", addr[0], "Hash: ", addr[1])
-	hash, err := parseHash(addr[1])
+	addr, id, err := parseAddress(scanner)
 	if err != nil {
 		return nil, "", err
 	}
-	prefixCount := idPrefixCount(hash)
-	if prefixCount == 32 {
-		return nil, "", fmt.Errorf("Hash Collision")
-	}
 
 	info := &ConnectedNodeInfo{
-		Addr:   addr[0],
-		NodeId: hash,
+		Addr:   addr,
+		NodeId: id,
 	}
 
 	/*
@@ -51,6 +34,7 @@ func helpNodeToJoin(scanner *bufio.Scanner) (*ConnectedNodeInfo, string, error) 
 	rwLock.RLock()
 	defer rwLock.RUnlock()
 
+	prefixCount := idPrefixCount(id)
 	resp := &strings.Builder{}
 	fmt.Fprintf(resp, "%s %s\n", selfAddr, selfNodeId.hash)
 	{ // Writing Routing Table Info
@@ -71,7 +55,7 @@ func helpNodeToJoin(scanner *bufio.Scanner) (*ConnectedNodeInfo, string, error) 
 	}
 
 	// Find the next closest
-	bestConn, err := getClosestNode(hash, routingTable[prefixCount], leafNodesLeft, leafNodesRight)
+	bestConn, err := getClosestNode(id, routingTable[prefixCount], leafNodesLeft, leafNodesRight)
 	if err != nil {
 		return nil, "", fmt.Errorf("ERR: Internal Server Error: %v", err)
 	}
@@ -95,6 +79,7 @@ func helpNodeToJoin(scanner *bufio.Scanner) (*ConnectedNodeInfo, string, error) 
 		fmt.Fprintf(resp, "%s %s", n.Addr, n.NodeId.hash)
 		first = false
 	}
+
 	for _, n := range leafNodesRight {
 		if n.Conn == nil {
 			break
