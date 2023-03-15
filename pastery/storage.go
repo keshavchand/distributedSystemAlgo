@@ -10,7 +10,7 @@ type Storage map[string]string
 var storage Storage
 var storageLock sync.RWMutex
 
-func Set(key, val string) {
+func Put(key, val string) {
 	storageLock.Lock()
 	defer storageLock.Unlock()
 

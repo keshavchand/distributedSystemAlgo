@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"strings"
-	"sync"
 )
 
 func joinNetwork(addr string, rts, leaf map[string]struct{}) {
@@ -38,20 +36,16 @@ func joinNetwork(addr string, rts, leaf map[string]struct{}) {
 	// TODO: scanner.Text() may return error
 	// check for that
 	scanner := bufio.NewScanner(conn)
-	if !scanner.Scan() {
-		log.Fatal("Unexprected Response from server when joining")
+
+	url, id, err := parseAddress(scanner)
+	if err != nil {
+		log.Fatal(err)
 	}
-	serverInfo := scanner.Text()
-	url, id, found := strings.Cut(serverInfo, " ")
-	if !found {
-		log.Fatalf("Unexprected Response from server when joining : Server address %s", serverInfo)
-	}
-	log.Println("Server Info", url, id)
+	log.Println("Server Info", url, id.hash)
 
 	func() {
 		rwLock.Lock()
 		defer rwLock.Unlock()
-		id, err := parseHash(id)
 		if err != nil {
 			log.Println(err)
 			return
@@ -76,57 +70,22 @@ func joinNetwork(addr string, rts, leaf map[string]struct{}) {
 		insertInLeafNode(t)
 	}()
 
-	if !scanner.Scan() {
-		log.Fatal("Expected from server: Routing Table : Scanner Failed")
+	err = parseManyAddress(scanner, rts)
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	var wg sync.WaitGroup
-	defer wg.Wait()
-
-	serverInfo = scanner.Text()
-	routingTableInfo := strings.Split(serverInfo, ";")
-	for _, rtInfo := range routingTableInfo {
-		addr, _, found := strings.Cut(rtInfo, " ")
-		if !found {
-			log.Println(rtInfo)
-			return
-		}
-
-		if addr == selfAddr {
-			continue
-		}
-		log.Println("Got: ", addr, id)
-		rts[addr] = struct{}{}
+	closestUrl, closestId, err := parseAddress(scanner)
+	if err != nil {
+		log.Fatal(err)
 	}
+	log.Println("Next closest Server Info", closestUrl, closestId.hash)
 
-	if !scanner.Scan() {
-		log.Fatal("Unexprected Response from server when joining")
-	}
-	serverInfo = scanner.Text()
-	closestUrl, closestId, found := strings.Cut(serverInfo, " ")
-	if !found {
-		log.Fatalf("Unexprected Response from server when joining : Server address %s", serverInfo)
-	}
-	log.Println("Server Info", closestUrl, closestId)
-
-	if closestId == id {
+	if closestId.hash == id.hash {
 		// Accept leaf nodes
-		if !scanner.Scan() {
-			log.Fatal("Expected from server: Routing Table : Scanner Failed")
-		}
-
-		serverInfo = scanner.Text()
-		routingTableInfo := strings.Split(serverInfo, ";")
-		for _, rtInfo := range routingTableInfo {
-			addr, _, found := strings.Cut(rtInfo, " ")
-			if !found {
-				log.Println(rtInfo)
-				break
-			}
-			if addr == selfAddr {
-				continue
-			}
-			leaf[addr] = struct{}{}
+		err := parseManyAddress(scanner, leaf)
+		if err != nil {
+			log.Fatal(err)
 		}
 	} else {
 		joinNetwork(closestUrl, rts, leaf)

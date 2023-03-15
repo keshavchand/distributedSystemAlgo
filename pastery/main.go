@@ -22,6 +22,9 @@ var routingTable [32][16]ConnectedNodeInfo
 var leafNodesLeft [16]ConnectedNodeInfo
 var leafNodesRight [16]ConnectedNodeInfo
 
+var keyToConnLock sync.RWMutex
+var keyToConn map[string]net.Conn
+
 // 32 hex digits
 var selfAddr string
 var selfNodeId *Hash
@@ -30,6 +33,7 @@ var GlobalWaitGroup sync.WaitGroup
 
 func main() {
 	log.SetFlags(log.Lshortfile | log.LstdFlags)
+	keyToConn = make(map[string]net.Conn)
 
 	defer GlobalWaitGroup.Wait()
 	var addrToConnect string
@@ -72,7 +76,6 @@ func main() {
 			delete(rts, addrToConnect)
 			delete(leaf, addrToConnect)
 
-
 			// TODO: Before Inserting check is slot is present
 			// it is used to store resource as the connected sockets are
 			// never disconnected
@@ -93,9 +96,9 @@ func main() {
 					continue
 				}
 
-				t := ConnectedNodeInfo {
-					Conn: conn,
-					Addr: addr,
+				t := ConnectedNodeInfo{
+					Conn:   conn,
+					Addr:   addr,
 					NodeId: id,
 				}
 
@@ -109,7 +112,7 @@ func main() {
 				go func() {
 					defer GlobalWaitGroup.Done()
 					handleConnection(conn)
-				} ()
+				}()
 			}
 
 			for k, _ := range leaf {
@@ -132,9 +135,9 @@ func main() {
 					continue
 				}
 
-				t := ConnectedNodeInfo {
-					Conn: conn,
-					Addr: addr,
+				t := ConnectedNodeInfo{
+					Conn:   conn,
+					Addr:   addr,
 					NodeId: id,
 				}
 
@@ -144,7 +147,7 @@ func main() {
 				go func() {
 					defer GlobalWaitGroup.Done()
 					handleConnection(conn)
-				} ()
+				}()
 			}
 		}()
 	}
@@ -183,6 +186,8 @@ func handleConnection(conn net.Conn) {
 	defer cleanup(nodeInfo)
 	// cleanup routing table and leaf node
 	// after removal
+
+	//XXX: Error Messages retured to connection are literally useless here
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
 		command := strings.ToLower(scanner.Text())
@@ -195,7 +200,7 @@ func handleConnection(conn net.Conn) {
 
 			info, resp, err := helpNodeToJoin(scanner)
 			if err != nil {
-				fmt.Fprintf(conn, "Parsing Error %v", err)
+				log.Printf("Join Parsing Error: ", err)
 				continue
 			}
 			info.Conn = conn
@@ -203,19 +208,184 @@ func handleConnection(conn net.Conn) {
 			nodeInfo = info
 			manageInternalJoin(info)
 			fmt.Fprintf(conn, resp)
+
 		case "notify":
 			err := handleNotify(conn, scanner)
 			if err != nil {
-				fmt.Fprintf(conn, "Parsing Error %v", err)
-				log.Printf("Parsing Error %v", err)
+				log.Printf("Notify: Parsing Error: %v\n", err)
 				continue
 			}
+
+		case "put":
+			k, v, err := getKV(scanner)
+			if err != nil {
+				log.Println("GetKV: Paring Error:", err)
+				continue
+			}
+
+			log.Println("Put Request", k, v)
+			cont := func() bool {
+				keyToConnLock.RLock()
+				defer keyToConnLock.RUnlock()
+				_, p := keyToConn[k]
+				if p {
+					log.Println("Attempt to reinsert value")
+					return true
+				}
+				return false
+			}()
+
+			if cont {
+				continue
+			}
+
+			node, this, err := findClosestNode(k)
+			if err != nil {
+				log.Println(err)
+				continue
+			}
+
+			if this {
+				Put(k, v)
+				fmt.Fprintf(conn, "resp\n%s OK\n", k)
+				continue
+			}
+
+			go func(node ConnectedNodeInfo, conn net.Conn, key, val string) {
+				keyToConnLock.Lock()
+				defer keyToConnLock.Unlock()
+				keyToConn[key] = conn
+
+				fmt.Fprintf(node.Conn, "put\n%s %s\n", key, val)
+			}(node, conn, k, v)
+
+		case "get":
+			k, err := getK(scanner)
+			if err != nil {
+				log.Println("GetK: Paring Error:", err)
+				continue
+			}
+
+			log.Println("Get Request", k)
+
+			cont := func() bool {
+				keyToConnLock.RLock()
+				defer keyToConnLock.RUnlock()
+				_, p := keyToConn[k]
+				if p {
+					log.Println("Attempt to reinsert value")
+					return true
+				}
+				return false
+			}()
+
+			if cont {
+				continue
+			}
+
+			node, this, err := findClosestNode(k)
+			if err != nil {
+				log.Println(err)
+				continue
+			}
+
+			if this {
+				res, err := Get(k)
+				if err != nil {
+					fmt.Fprintf(conn, "resp\n%s %v\n", k, err)
+					continue
+				}
+				fmt.Fprintf(conn, "resp\n%s %s\n", k, res)
+				continue
+			}
+
+			go func(node ConnectedNodeInfo, conn net.Conn, key string) {
+				keyToConnLock.Lock()
+				defer keyToConnLock.Unlock()
+				keyToConn[key] = conn
+
+				fmt.Fprintf(node.Conn, "get\n%s\n", key)
+			}(node, conn, k)
+		case "resp":
+			if !scanner.Scan() {
+				log.Println("Error nothing in resp")
+				continue
+			}
+
+			resp := scanner.Text()
+			go func(resp string) {
+				key, _, found := strings.Cut(resp, " ")
+				if !found {
+					log.Println("Wrong Response", resp)
+					return
+				}
+
+				keyToConnLock.Lock()
+				defer keyToConnLock.Unlock()
+				conn, p := keyToConn[key]
+				if !p {
+					log.Println("Wrong Response", resp)
+					return
+				}
+
+				fmt.Fprintf(conn, "resp\n%s\n", resp)
+				delete(keyToConn, key)
+			}(resp)
 		case "exit":
 			break
 		default:
 			fmt.Fprintf(conn, "Unimplemented : %s", command)
 		}
 	}
+}
+
+// NodeId and whether it is self, err
+func findClosestNode(key string) (ConnectedNodeInfo, bool, error) {
+	hash, err := parseHash(key)
+	if err != nil {
+		return ConnectedNodeInfo{}, false, err
+	}
+	count := idPrefixCount(hash)
+	if count == 32 {
+		return ConnectedNodeInfo{}, true, nil
+	}
+
+	rwLock.RLock()
+	defer rwLock.RUnlock()
+	nodeLeaf, g := searchLeafNodes(hash)
+	if g {
+		return nodeLeaf, nodeLeaf.Addr == selfAddr, nil
+	}
+
+	nodeRt, err := getClosestNode(hash, routingTable[count])
+	if isComparativelyCloserTo(hash, nodeLeaf.NodeId, nodeRt.NodeId) {
+		return nodeLeaf, nodeLeaf.Addr == selfAddr, nil
+	}
+	return nodeRt, nodeRt.Addr == selfAddr, nil
+}
+
+func getK(scanner *bufio.Scanner) (key string, err error) {
+	if !scanner.Scan() {
+		err = fmt.Errorf("Wrong Data")
+		return
+	}
+	key = scanner.Text()
+	return
+}
+
+func getKV(scanner *bufio.Scanner) (key, value string, err error) {
+	if !scanner.Scan() {
+		err = fmt.Errorf("Wrong Data")
+		return
+	}
+
+	key, value, found := strings.Cut(scanner.Text(), " ")
+	if !found {
+		err = fmt.Errorf("Wrong Key Value")
+		return
+	}
+
+	return
 }
 
 func cleanup(info *ConnectedNodeInfo) {
@@ -231,7 +401,7 @@ func handleNotify(conn net.Conn, scanner *bufio.Scanner) error {
 	*
 	* reply:
 	* <Self Addr> <Info>
-	*/
+	 */
 	if !scanner.Scan() {
 		log.Println("Can't read from scanner")
 		return fmt.Errorf("Can't read from scanner")
@@ -278,6 +448,41 @@ func handleNotify(conn net.Conn, scanner *bufio.Scanner) error {
 	return nil
 }
 
+// the best leaf Node and the guarantee that this is the best node
+func searchLeafNodes(hash *Hash) (ConnectedNodeInfo, bool) {
+	res := Compare(selfNodeId, hash)
+
+	bestNode := ConnectedNodeInfo{
+		Addr:   selfAddr,
+		NodeId: selfNodeId,
+	}
+
+	//XXX: This function should be called only
+	// after the node is checked for same id
+	if res == 0 {
+		log.Fatal("Shouldn't be here")
+		return bestNode, false
+	}
+
+	leafNodes := &leafNodesLeft
+	if res > 0 {
+		leafNodes = &leafNodesRight
+	}
+
+	for _, n := range leafNodes {
+		if n.Conn == nil {
+			return bestNode, false
+		}
+
+		if isComparativelyCloserTo(hash, n.NodeId, bestNode.NodeId) {
+			bestNode = n
+		} else {
+			return n, true
+		}
+	}
+	return bestNode, false
+}
+
 func getClosestNode(hash *Hash, tables ...[16]ConnectedNodeInfo) (ConnectedNodeInfo, error) {
 	bestConn := ConnectedNodeInfo{
 		Conn:   nil,
@@ -297,9 +502,7 @@ func getClosestNode(hash *Hash, tables ...[16]ConnectedNodeInfo) (ConnectedNodeI
 			if isCloser {
 				bestConn = t
 			}
-
 		}
 	}
-
 	return bestConn, nil
 }

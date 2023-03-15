@@ -35,3 +35,28 @@ func parseAddress(scanner *bufio.Scanner) (add string, id *Hash, err error) {
 
 	return addr[0], hash, nil
 }
+
+func parseManyAddress(scanner *bufio.Scanner, addr map[string]struct{}) error{
+	if !scanner.Scan() {
+		return fmt.Errorf("Empty Data Stream")
+	}
+
+	serverInfo := scanner.Text()
+	routingTableInfo := strings.Split(serverInfo, ";")
+
+	for _, rtInfo := range routingTableInfo {
+		a, _, found := strings.Cut(rtInfo, " ")
+		if !found {
+			log.Println(rtInfo)
+			continue
+		}
+
+		if a == selfAddr {
+			continue
+		}
+
+		addr[a] = struct{} {}
+	}
+
+	return nil
+}
